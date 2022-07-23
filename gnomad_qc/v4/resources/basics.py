@@ -10,7 +10,10 @@ from gnomad.resources.resource_utils import (
 
 from gnomad_qc.v4.resources.constants import CURRENT_VERSION
 from gnomad_qc.v4.resources.meta import meta
-from gnomad_qc.v4.resources.sample_qc import hard_filtered_samples, hard_filtered_samples_no_sex
+from gnomad_qc.v4.resources.sample_qc import (
+    hard_filtered_samples,
+    hard_filtered_samples_no_sex,
+)
 
 logger = logging.getLogger("basic_resources")
 logger.setLevel(logging.INFO)
@@ -59,18 +62,16 @@ def get_gnomad_v4_vds(
                 hard_filter_expr = meta_ht.rand_sampling_meta.hard_filters_no_sex
             else:
                 hard_filter_expr = meta_ht.rand_sampling_meta.hard_filters
-            meta_ht = meta_ht.filter(
-                hl.len(hard_filter_expr) == 0
-            )
+            meta_ht = meta_ht.filter(hl.len(hard_filter_expr) == 0)
             vds = hl.vds.filter_samples(vds, meta_ht)
         else:
             if remove_hard_filtered_samples:
                 hard_filter_ht = hard_filtered_samples.versions[CURRENT_VERSION].ht()
             else:
-                hard_filter_ht = hard_filtered_samples_no_sex.versions[CURRENT_VERSION].ht()
-            vds = hl.vds.filter_samples(
-                vds, hard_filter_ht, keep=False
-            )
+                hard_filter_ht = hard_filtered_samples_no_sex.versions[
+                    CURRENT_VERSION
+                ].ht()
+            vds = hl.vds.filter_samples(vds, hard_filter_ht, keep=False)
 
     if release_only:
         if test:
@@ -224,6 +225,7 @@ all_ukb_samples_to_remove = f"{_ukb_root_path()}/all_ukbb_samples_to_remove.txt"
 
 # UKB f-stat sites Table with UKB allele frequencies
 ukb_f_stat = TableResource(f"{_ukb_root_path()}/f_stat_sites.ht")
+
 
 def qc_temp_prefix(version: str = CURRENT_VERSION) -> str:
     """

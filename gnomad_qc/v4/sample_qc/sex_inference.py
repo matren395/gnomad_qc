@@ -133,7 +133,7 @@ def load_platform_ht(
 def load_coverage_mt(
     test: bool = False,
     calling_interval_name: str = "intersection",
-    calling_interval_padding: int = 50
+    calling_interval_padding: int = 50,
 ):
     """
 
@@ -171,22 +171,29 @@ def load_coverage_mt(
 def generate_sex_imputation_coverage_mt(
     mt: hl.MatrixTable,
     platform_ht: hl.Table,
-    mean_dp_thresholds: List,
+    contigs: List[str] = ["chrX", "chrY", "chr20"],
+    mean_dp_thresholds: List[int] = [5, 10, 15, 20, 25],
 ) -> hl.Table:
     """
     Create a Table of fraction of samples per interval and per platform with mean DP over specified thresholds.
 
     :param mt: Input interval coverage MatrixTable
-        inference. Using only intervals that are considered high coverage across all platforms
-    :param platform_ht: Input platform assignment Table. This is only needed if per_platform or high_cov_by_platform_all are True
+    :param platform_ht: Input platform assignment Table
+    :param contigs: Which contigs to filter to before computing the fraction of sample over DP thresholds
     :param mean_dp_thresholds: List of mean DP cutoffs to determining the fraction of samples with mean coverage >= the
         cutoff for each interval
     :return: Table with annotations for the fraction of samples per interval and per platform over DP thresholds
     """
+    logger.info(
+        "Filtering interval coverage MatrixTable to the following contigs: %s...",
+        ", ".join(contigs),
+    )
+    contigs = hl.literal(contigs)
+    mt = mt.filter_rows(contigs.contains(mt.interval.start.contig))
     mt = mt.annotate_cols(platform=platform_ht[mt.col_key].qc_platform)
     mt = mt.annotate_rows(
         **{
-            f"over_{dp}x": hl.agg.fraction(hl.agg.fraction(mt.mean_dp >= dp))
+            f"over_{dp}x": hl.agg.fraction(mt.mean_dp >= dp)
             for dp in mean_dp_thresholds
         }
     )
@@ -315,10 +322,14 @@ def compute_sex(
     :return: Table with inferred sex annotation
     """
     if (per_platform or high_cov_by_platform_all) and platform_ht is None:
-        raise ValueError("'platform_ht' must be defined if 'per_platform' or 'high_cov_by_platform_all' is True!")
+        raise ValueError(
+            "'platform_ht' must be defined if 'per_platform' or 'high_cov_by_platform_all' is True!"
+        )
 
     if per_platform and high_cov_by_platform_all:
-        raise ValueError("Only one of 'per_platform' or 'high_cov_by_platform_all' can be True!")
+        raise ValueError(
+            "Only one of 'per_platform' or 'high_cov_by_platform_all' can be True!"
+        )
 
     if high_cov_intervals and high_cov_by_platform_all:
         logger.warning(
@@ -327,7 +338,7 @@ def compute_sex(
         )
 
     def _get_high_coverage_intervals_ht(
-        coverage_mt:hl.MatrixTable,
+        coverage_mt: hl.MatrixTable,
         prefix: str = "",
         agg_func: Callable[
             [hl.expr.BooleanExpression], hl.BooleanExpression
@@ -398,7 +409,7 @@ def compute_sex(
     if per_platform:
         logger.info(
             "Running sex ploidy and sex karyotype estimation per platform %s...",
-            "using per platform high coverage intervals" if high_cov_intervals else ""
+            "using per platform high coverage intervals" if high_cov_intervals else "",
         )
         platforms = platform_ht.aggregate(
             hl.agg.collect_as_set(platform_ht.qc_platform)
@@ -412,13 +423,15 @@ def compute_sex(
             if high_cov_intervals:
                 calling_intervals_ht = _get_high_coverage_intervals_ht(
                     coverage_mt.filter_cols(coverage_mt.platform == platform),
-                    prefix="platform_"
+                    prefix="platform_",
                 )
             else:
                 calling_intervals_ht = coverage_mt.rows()
             sex_ht = _annotate_sex(
-                hl.vds.filter_samples(vds, platform_ht.filter(platform_ht.qc_platform == platform)),
-                calling_intervals_ht
+                hl.vds.filter_samples(
+                    vds, platform_ht.filter(platform_ht.qc_platform == platform)
+                ),
+                calling_intervals_ht,
             )
             sex_ht = sex_ht.annotate(platform=platform)
             per_platform_sex_hts.append(sex_ht)
@@ -435,12 +448,16 @@ def compute_sex(
             "Limited to platforms with at least %s samples...",
             min_platform_size,
         )
-        coverage_mt = coverage_mt.filter_cols(coverage_mt.n_samples >= min_platform_size)
-        calling_intervals_ht = _get_high_coverage_intervals_ht(coverage_mt, prefix="platform_")
+        coverage_mt = coverage_mt.filter_cols(
+            coverage_mt.n_samples >= min_platform_size
+        )
+        calling_intervals_ht = _get_high_coverage_intervals_ht(
+            coverage_mt, prefix="platform_"
+        )
         sex_ht = _annotate_sex(vds, calling_intervals_ht)
     elif high_cov_intervals:
         logger.info(
-             "Running sex ploidy and sex karyotype estimation using high coverage intervals across the full sample set..."
+            "Running sex ploidy and sex karyotype estimation using high coverage intervals across the full sample set..."
         )
         calling_intervals_ht = _get_high_coverage_intervals_ht(coverage_mt, lambda x: x)
         sex_ht = _annotate_sex(vds, calling_intervals_ht)
@@ -475,6 +492,7 @@ def main(args):
     test = args.test
     calling_interval_name = args.calling_interval_name
     calling_interval_padding = args.calling_interval_padding
+    normalization_contig = args.normalization_contig
 
     try:
         if args.determine_fstat_sites:
@@ -490,30 +508,29 @@ def main(args):
                 min_callrate=args.min_callrate,
             )
             ht.write(
-                get_checkpoint_path("test_f_stat_sites")
-                if test
-                else f_stat_sites.path,
+                get_checkpoint_path("test_f_stat_sites") if test else f_stat_sites.path,
                 overwrite=args.overwrite,
             )
 
         if args.sex_imputation_interval_qc:
-            coverage_mt = load_coverage_mt(test, calling_interval_name, calling_interval_padding)
-            logger.info(
-                "Filtering interval coverage MatrixTable to chrX, chrY and %s...",
-                args.normalization_contig,
+            coverage_mt = load_coverage_mt(
+                test, calling_interval_name, calling_interval_padding
             )
-            coverage_mt = hl.filter_intervals(
-                coverage_mt,
-                [hl.parse_locus_interval(contig) for contig in ["chrX", "chrY", args.normalization_contig]],
+            platform_ht = load_platform_ht(
+                test, calling_interval_name, calling_interval_padding
             )
-            
-            platform_ht = load_platform_ht(test, calling_interval_name, calling_interval_padding)
             coverage_mt = generate_sex_imputation_coverage_mt(
                 coverage_mt,
                 platform_ht,
+                contigs=["chrX", "chrY", normalization_contig],
                 mean_dp_thresholds=args.mean_dp_thresholds,
             )
-            coverage_mt.write(sex_imputation_coverage.path, overwrite=args.overwrite)
+            coverage_mt.write(
+                get_checkpoint_path("test_sex_imputation_cov", mt=True)
+                if test
+                else sex_imputation_coverage.path,
+                overwrite=args.overwrite,
+            )
 
         if args.impute_sex:
             vds = get_gnomad_v4_vds(
@@ -543,7 +560,13 @@ def main(args):
                     or args.per_platform
                     or args.high_cov_by_platform_all
                 ):
-                    coverage_mt = sex_imputation_coverage.mt()
+                    coverage_mt = (
+                        hl.read_matrix_table(
+                            get_checkpoint_path("test_sex_imputation_cov", mt=True)
+                        )
+                        if test
+                        else sex_imputation_coverage.mt()
+                    )
                 else:
                     coverage_mt = interval_coverage.mt()
 
@@ -555,7 +578,7 @@ def main(args):
                     args.high_cov_by_platform_all,
                     platform_ht,
                     args.min_platform_size,
-                    args.normalization_contig,
+                    normalization_contig,
                     args.variant_depth_only_x_ploidy,
                     args.variant_depth_only_y_ploidy,
                     args.x_cov,
@@ -588,6 +611,7 @@ def main(args):
         logger.info("Copying log to logging bucket...")
         hl.copy_log(get_logging_path("sex_inference"))
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -601,7 +625,7 @@ if __name__ == "__main__":
         action="store_true",
     )
     parser.add_argument(
-        "--determine_fstat_sites",
+        "--determine-fstat-sites",
         help=(
             "Create Table of common (> value specified by '--min-af'), bi-allelic SNPs on chromosome X for f-stat "
             "calculations. Additionally filter to high callrate (> value specified by '--min-callrate') variants "
@@ -623,6 +647,12 @@ if __name__ == "__main__":
         action="store_true",
     )
     parser.add_argument(
+        "--normalization-contig",
+        help="Which autosomal chromosome to use for normalizing the coverage of chromosomes X and Y.",
+        type=str,
+        default="chr20",
+    )
+    parser.add_argument(
         "--mean-dp-thresholds",
         help=(
             "List of mean DP cutoffs to determining the fraction of samples with mean coverage >= the cutoff for each "
@@ -641,7 +671,7 @@ if __name__ == "__main__":
         "--f-stat-ukbb-var",
         help=(
             "Whether to use UK Biobank high callrate (0.99) and common variants (UKBB allele frequency > value specified "
-            "by '--min-af') for f-stat computation instead of the sites determined by '--determine_fstat_sites'. "
+            "by '--min-af') for f-stat computation instead of the sites determined by '--determine-fstat-sites'. "
         ),
         action="store_true",
     )
@@ -690,12 +720,6 @@ if __name__ == "__main__":
         ),
         type=int,
         default=100,
-    )
-    parser.add_argument(
-        "--normalization-contig",
-        help="Which autosomal chromosome to use for normalizing the coverage of chromosomes X and Y.",
-        type=str,
-        default="chr20",
     )
     parser.add_argument(
         "--variant-depth-only-x-ploidy",
@@ -786,7 +810,6 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    main(args)
 
     if args.slack_channel:
         with slack_notifications(slack_token, args.slack_channel):

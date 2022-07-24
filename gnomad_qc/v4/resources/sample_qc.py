@@ -275,6 +275,17 @@ relatedness = VersionedTableResource(
     },
 )
 
+# Sex imputation coverage aggregate stats MT
+sex_imputation_coverage = VersionedTableResource(
+    CURRENT_VERSION,
+    {
+        version: TableResource(
+            f"{get_sample_qc_root(version)}/gnomad.exomes.v{version}.sex_imputation_coverage.ht"
+        )
+        for version in VERSIONS
+    },
+)
+
 # Sex imputation results
 sex = VersionedTableResource(
     CURRENT_VERSION,

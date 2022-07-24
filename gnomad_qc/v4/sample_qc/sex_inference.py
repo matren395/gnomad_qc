@@ -1,6 +1,8 @@
 import argparse
+import functools
 import logging
-from typing import Callable
+import operator
+from typing import Callable, List, Union
 
 import hail as hl
 
@@ -20,6 +22,7 @@ from gnomad_qc.v4.resources.sample_qc import (
     interval_coverage,
     platform,
     sex,
+    sex_imputation_coverage,
 )
 
 logging.basicConfig(format="%(levelname)s (%(name)s %(lineno)s): %(message)s")
@@ -87,6 +90,46 @@ def determine_fstat_sites(
         )
 
     return ht
+
+
+def generate_sex_imputation_coverage_mt(
+    mt: hl.MatrixTable,
+    platform_ht: hl.Table,
+    mean_dp_thresholds: List,
+) -> hl.Table:
+    """
+    Create a Table of fraction of samples per interval and per platform with mean DP over specified thresholds.
+
+    :param mt: Input interval coverage MatrixTable
+        inference. Using only intervals that are considered high coverage across all platforms
+    :param platform_ht: Input platform assignment Table. This is only needed if per_platform or high_cov_by_platform_all are True
+    :param mean_dp_thresholds: List of mean DP cutoffs to determining the fraction of samples with mean coverage >= the
+        cutoff for each interval
+    :return: Table with annotations for the fraction of samples per interval and per platform over DP thresholds
+    """
+    mt = mt.annotate_cols(platform=platform_ht[mt.col_key].qc_platform)
+    mt = mt.annotate_rows(
+        **{
+            "prop_samples_by_dp": hl.struct(
+                **{
+                    f"over_{dp}x": hl.agg.fraction(hl.agg.fraction(mt.mean_dp >= dp))
+                    for dp in mean_dp_thresholds
+                }
+            ),
+        }
+    )
+
+    logger.info("Adding per platform aggregation...")
+    mt = mt.group_cols_by(mt.platform).aggregate(
+        **{
+            f"over_{dp}x": hl.agg.fraction(mt.mean_dp >= dp)
+            for dp in mean_dp_thresholds
+        }
+    )
+
+    mt = mt.annotate_globals(mean_dp_thresholds=mean_dp_thresholds)
+
+    return mt
 
 
 def compute_sex(
@@ -196,35 +239,40 @@ def compute_sex(
     :return: Table with inferred sex annotation
     """
 
-    def _get_filtered_coverage_mt(
-        coverage_mt: hl.MatrixTable,
+    def _get_filtered_coverage_t(
+        coverage_t: Union[hl.Table, hl.MatrixTable],
         agg_func: Callable[
             [hl.expr.BooleanExpression], hl.BooleanExpression
         ] = hl.agg.all,
-    ) -> hl.MatrixTable:
+    ) -> Union[hl.Table, hl.MatrixTable]:
         """
         Helper function to filter the interval coverage MatrixTable to high coverage intervals.
 
         High coverage intervals are determined using `agg_func`, `x_cov`, `y_cov`, `norm_cov`, `prop_samples_x`,
         `prop_samples_y`, and `prop_samples_norm`.
 
-        :param coverage_mt: Input interval coverage MatrixTable
+        :param coverage_t: Input interval coverage Table or MatrixTable
         :param agg_func: Hail aggregation function to determine if an interval coverage meets the `cov_*`> `prop_samples_*` criteria
-        :return: Filtered interval coverage MatrixTable
+        :return: Filtered interval coverage Table or MatrixTable
         """
-        return coverage_mt.filter_rows(
-            (
-                (coverage_mt.interval.start.contig == "chrX")
-                & agg_func(coverage_mt[f"over_{x_cov}x"] > prop_samples_x)
-            )
-            | (
-                (coverage_mt.interval.start.contig == "chrY")
-                & agg_func(coverage_mt[f"over_{y_cov}x"] > prop_samples_y)
-            )
-            | (
-                (coverage_mt.interval.start.contig == "chr20")
-                & agg_func(coverage_mt[f"over_{norm_cov}x"] > prop_samples_norm)
-            )
+        prop_samples_dict = {
+            "chrX": (x_cov, prop_samples_x),
+            "chrY": (y_cov, prop_samples_y),
+            normalization_contig: (norm_cov, prop_samples_norm),
+        }
+        filter_expr = functools.reduce(
+            operator._or,
+            [
+                (coverage_t.interval.start.contig == contig)
+                & agg_func(coverage_t[f"over_{cov}x"] > prop_samples)
+                for contig, (cov, prop_samples) in prop_samples_dict.items()
+            ],
+        )
+
+        return (
+            coverage_t.filter(filter_expr)
+            if isinstance(coverage_t, hl.Table)
+            else coverage_t.filter_rows(filter_expr)
         )
 
     def _annotate_sex(vds, calling_intervals_ht):
@@ -268,21 +316,6 @@ def compute_sex(
             normalization_contig,
         )
 
-        if per_platform or high_cov_by_platform_all:
-            logger.info("Annotating coverage MatrixTable with platform information")
-            coverage_mt = coverage_mt.annotate_cols(
-                platform=platform_ht[coverage_mt.col_key].qc_platform
-            )
-            coverage_mt = coverage_mt.group_cols_by(coverage_mt.platform).aggregate(
-                **{
-                    f"over_{x_cov}x": hl.agg.fraction(coverage_mt.mean_dp > x_cov),
-                    f"over_{y_cov}x": hl.agg.fraction(coverage_mt.mean_dp > y_cov),
-                    f"over_{norm_cov}x": hl.agg.fraction(
-                        coverage_mt.mean_dp > norm_cov
-                    ),
-                }
-            )
-
         if per_platform:
             logger.info(
                 "Running sex ploidy and sex karyotype estimation per platform using per platform "
@@ -294,7 +327,7 @@ def compute_sex(
             for platform in platforms:
                 ht = platform_ht.filter(platform_ht.qc_platform == platform)
                 logger.info("Platform %s has %d samples...", platform, ht.count())
-                coverage_platform_mt = _get_filtered_coverage_mt(
+                coverage_platform_mt = _get_filtered_coverage_t(
                     coverage_mt.filter_cols(coverage_mt.platform == platform)
                 )
                 calling_intervals_ht = coverage_platform_mt.rows()
@@ -325,23 +358,16 @@ def compute_sex(
             coverage_mt = coverage_mt.filter_cols(
                 coverage_mt.n_samples >= min_platform_size
             )
-            coverage_mt = _get_filtered_coverage_mt(coverage_mt)
+            coverage_mt = _get_filtered_coverage_t(coverage_mt)
             calling_intervals_ht = coverage_mt.rows()
             sex_ht = _annotate_sex(vds, calling_intervals_ht)
         else:
             logger.info(
                 "Running sex ploidy and sex karyotype estimation using high coverage intervals across the full sample set..."
             )
-            coverage_mt = coverage_mt.annotate_rows(
-                **{
-                    f"over_{x_cov}x": hl.agg.fraction(coverage_mt.mean_dp > x_cov),
-                    f"over_{y_cov}x": hl.agg.fraction(coverage_mt.mean_dp > y_cov),
-                    f"over_{norm_cov}x": hl.agg.fraction(
-                        coverage_mt.mean_dp > norm_cov
-                    ),
-                }
-            )
-            coverage_mt = _get_filtered_coverage_mt(coverage_mt, lambda x: x)
+            coverage_ht = coverage_mt.rows()
+            coverage_ht = coverage_ht.select(**coverage_ht.prop_samples_by_dp)
+            coverage_mt = _get_filtered_coverage_t(coverage_ht, lambda x: x)
             calling_intervals_ht = coverage_mt.rows()
             sex_ht = _annotate_sex(vds, calling_intervals_ht)
     else:
@@ -415,6 +441,67 @@ def main(args):
                 else f_stat_sites.path,
                 overwrite=args.overwrite,
             )
+        if args.sex_imputation_interval_qc:
+            logger.info(
+                "Loading interval coverage MatrixTable and filtering to chrX, chrY and %s...",
+                args.normalization_contig,
+            )
+            if file_exists(interval_coverage.path):
+                coverage_mt = interval_coverage.mt()
+            elif args.test:
+                test_coverage_path = get_checkpoint_path(
+                    f"test_interval_coverage.{args.calling_interval_name}.pad{args.calling_interval_padding}",
+                    mt=True,
+                )
+                if file_exists(test_coverage_path):
+                    coverage_mt = hl.read_matrix_table(test_coverage_path)
+                else:
+                    raise FileNotFoundError(
+                        f"There is no final coverage MatrixTable written and a test interval coverage MatrixTable does "
+                        f"not exist for calling interval {args.calling_interval_name} and interval padding "
+                        f"{args.calling_interval_padding}. Please run platform_inference.py --compute_coverage with the "
+                        f"--test argument and needed --calling_interval_name/--calling_interval_padding arguments."
+                    )
+            else:
+                raise FileNotFoundError(
+                    f"There is no final coverage MatrixTable written. Please run: "
+                    f"platform_inference.py --compute_coverage to compute the interval coverage MatrixTable."
+                )
+
+            coverage_mt = coverage_mt.filter_rows(
+                hl.literal({"chrY", "chrX", args.normalization_contig}).contains(
+                    coverage_mt.interval.start.contig
+                )
+            )
+            logger.info("Loading platform information...")
+            if file_exists(platform.path):
+                platform_ht = platform.ht()
+            elif args.test:
+                test_platform_path = get_checkpoint_path(
+                    f"test_platform_assignment.{args.calling_interval_name}.pad{args.calling_interval_padding}"
+                )
+                if file_exists(test_platform_path):
+                    platform_ht = hl.read_table(test_platform_path)
+                else:
+                    raise FileNotFoundError(
+                        f"There is no final platform assignment Table written and a test platform assignment Table "
+                        f"does not exist for calling interval {args.calling_interval_name} and interval padding "
+                        f"{args.calling_interval_padding}. Please run platform_inference.py --assign_platforms "
+                        f"with the --test argument and needed --calling_interval_name/--calling_interval_padding "
+                        f"arguments."
+                    )
+            else:
+                raise FileNotFoundError(
+                    f"There is no final platform assignment Table written. Please run: "
+                    f"platform_inference.py --assign_platforms to compute the platform assignment Table."
+                )
+
+            coverage_mt = generate_sex_imputation_coverage_mt(
+                coverage_mt,
+                platform_ht,
+                mean_dp_thresholds=args.mean_dp_thresholds,
+            )
+            coverage_mt.write(sex_imputation_coverage.path, overwrite=args.overwrite)
         if args.impute_sex:
             vds = get_gnomad_v4_vds(
                 remove_hard_filtered_samples=False,
@@ -438,63 +525,14 @@ def main(args):
             if args.overwrite or not file_exists(
                 get_checkpoint_path("sex_imputation") if args.test else sex.path
             ):
-                logger.info(
-                    "Loading interval coverage MatrixTable and filtering to chrX, chrY and %s...",
-                    args.normalization_contig,
-                )
-                if file_exists(interval_coverage.path):
+                if (
+                    args.high_cov_intervals
+                    or args.per_platform
+                    or args.high_cov_by_platform_all
+                ):
+                    coverage_mt = sex_imputation_coverage.mt()
+                else:
                     coverage_mt = interval_coverage.mt()
-                elif args.test:
-                    test_coverage_path = get_checkpoint_path(
-                        f"test_interval_coverage.{args.calling_interval_name}.pad{args.calling_interval_padding}",
-                        mt=True,
-                    )
-                    if file_exists(test_coverage_path):
-                        coverage_mt = hl.read_matrix_table(test_coverage_path)
-                    else:
-                        raise FileNotFoundError(
-                            f"There is no final coverage MatrixTable written and a test interval coverage MatrixTable does "
-                            f"not exist for calling interval {args.calling_interval_name} and interval padding "
-                            f"{args.calling_interval_padding}. Please run platform_inference.py --compute_coverage with the "
-                            f"--test argument and needed --calling_interval_name/--calling_interval_padding arguments."
-                        )
-                else:
-                    raise FileNotFoundError(
-                        f"There is no final coverage MatrixTable written. Please run: "
-                        f"platform_inference.py --compute_coverage to compute the interval coverage MatrixTable."
-                    )
-
-                coverage_mt = coverage_mt.filter_rows(
-                    hl.literal({"chrY", "chrX", args.normalization_contig}).contains(
-                        coverage_mt.interval.start.contig
-                    )
-                )
-                if args.per_platform or args.high_cov_by_platform_all:
-                    logger.info("Loading platform information...")
-                    if file_exists(platform.path):
-                        platform_ht = platform.ht()
-                    elif args.test:
-                        test_platform_path = get_checkpoint_path(
-                            f"test_platform_assignment.{args.calling_interval_name}.pad{args.calling_interval_padding}"
-                        )
-                        if file_exists(test_platform_path):
-                            platform_ht = hl.read_table(test_platform_path)
-                        else:
-                            raise FileNotFoundError(
-                                f"There is no final platform assignment Table written and a test platform assignment Table "
-                                f"does not exist for calling interval {args.calling_interval_name} and interval padding "
-                                f"{args.calling_interval_padding}. Please run platform_inference.py --assign_platforms "
-                                f"with the --test argument and needed --calling_interval_name/--calling_interval_padding "
-                                f"arguments."
-                            )
-                    else:
-                        raise FileNotFoundError(
-                            f"There is no final platform assignment Table written. Please run: "
-                            f"platform_inference.py --assign_platforms to compute the platform assignment Table."
-                        )
-                else:
-                    platform_ht = None
-
                 ht = compute_sex(
                     vds,
                     coverage_mt,
@@ -565,6 +603,21 @@ if __name__ == "__main__":
             "determination of f-stat sites."
         ),
         action="store_true",
+    )
+    parser.add_argument(
+        "--sex-imputation-interval-qc",
+        help="",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--mean-dp-thresholds",
+        help=(
+            "List of mean DP cutoffs to determining the fraction of samples with mean coverage >= the cutoff for each "
+            "interval."
+        ),
+        type=int,
+        nargs="+",
+        default=[5, 10, 15, 20, 25],
     )
     parser.add_argument(
         "--impute-sex",

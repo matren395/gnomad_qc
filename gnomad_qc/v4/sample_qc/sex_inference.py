@@ -518,15 +518,14 @@ def main(args):
                 overwrite=args.overwrite,
             )
         if args.sex_imputation_interval_qc:
+            coverage_mt = load_coverage_mt(args.test, args.calling_interval_name, args.calling_interval_padding)
             logger.info(
-                "Loading interval coverage MatrixTable and filtering to chrX, chrY and %s...",
+                "Filtering interval coverage MatrixTable to chrX, chrY and %s...",
                 args.normalization_contig,
             )
-            coverage_mt = load_coverage_mt(args.test, args.calling_interval_name, args.calling_interval_padding)
-            coverage_mt = coverage_mt.filter_rows(
-                hl.literal({"chrY", "chrX", args.normalization_contig}).contains(
-                    coverage_mt.interval.start.contig
-                )
+            coverage_mt = hl.filter_intervals(
+                coverage_mt,
+                [hl.parse_locus_interval(contig) for contig in ["chrX", "chrY", args.normalization_contig]],
             )
             
             platform_ht = load_platform_ht(args.test, args.calling_interval_name, args.calling_interval_padding)

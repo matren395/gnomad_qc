@@ -2,7 +2,7 @@ import argparse
 import functools
 import logging
 import operator
-from typing import Callable, List, Union
+from typing import Callable, List
 
 import hail as hl
 
@@ -186,23 +186,23 @@ def generate_sex_imputation_coverage_mt(
     mt = mt.annotate_cols(platform=platform_ht[mt.col_key].qc_platform)
     mt = mt.annotate_rows(
         **{
-            "prop_samples_by_dp": hl.struct(
-                **{
-                    f"over_{dp}x": hl.agg.fraction(hl.agg.fraction(mt.mean_dp >= dp))
-                    for dp in mean_dp_thresholds
-                }
-            ),
+            f"over_{dp}x": hl.agg.fraction(hl.agg.fraction(mt.mean_dp >= dp))
+            for dp in mean_dp_thresholds
         }
     )
 
     logger.info("Adding per platform aggregation...")
     mt = mt.group_cols_by(mt.platform).aggregate(
         **{
-            f"over_{dp}x": hl.agg.fraction(mt.mean_dp >= dp)
+            f"platform_over_{dp}x": hl.agg.fraction(mt.mean_dp >= dp)
             for dp in mean_dp_thresholds
         }
     )
 
+    platform_ht = platform_ht.group_by(platform_ht.qc_platform).aggregate(
+        n_samples=hl.agg.count()
+    )
+    mt = mt.annotate_cols(n_samples=platform_ht[mt.col_key].n_samples)
     mt = mt.annotate_globals(mean_dp_thresholds=mean_dp_thresholds)
 
     return mt
@@ -314,22 +314,35 @@ def compute_sex(
     :param f_stat_cutoff: f-stat to roughly divide 'XX' from 'XY' samples. Assumes XX samples are below cutoff and XY are above cutoff
     :return: Table with inferred sex annotation
     """
+    if (per_platform or high_cov_by_platform_all) and platform_ht is None:
+        raise ValueError("'platform_ht' must be defined if 'per_platform' or 'high_cov_by_platform_all' is True!")
 
-    def _get_filtered_coverage_t(
-        coverage_t: Union[hl.Table, hl.MatrixTable],
+    if per_platform and high_cov_by_platform_all:
+        raise ValueError("Only one of 'per_platform' or 'high_cov_by_platform_all' can be True!")
+
+    if high_cov_intervals and high_cov_by_platform_all:
+        logger.warning(
+            "Both 'high_cov_intervals' and 'high_cov_by_platform_all' are True, high coverage intervals will be defined"
+            " as intervals that match high coverage criteria within all platforms."
+        )
+
+    def _get_high_coverage_intervals_ht(
+        coverage_mt:hl.MatrixTable,
+        prefix: str = "",
         agg_func: Callable[
             [hl.expr.BooleanExpression], hl.BooleanExpression
         ] = hl.agg.all,
-    ) -> Union[hl.Table, hl.MatrixTable]:
+    ) -> hl.Table:
         """
-        Helper function to filter the interval coverage MatrixTable to high coverage intervals.
+        Helper function to create a Table filtered to high coverage intervals.
 
         High coverage intervals are determined using `agg_func`, `x_cov`, `y_cov`, `norm_cov`, `prop_samples_x`,
         `prop_samples_y`, and `prop_samples_norm`.
 
-        :param coverage_t: Input interval coverage Table or MatrixTable
+        :param coverage_mt: Input interval coverage MatrixTable
+        :param prefix: Prefix of aggregate coverage annotation
         :param agg_func: Hail aggregation function to determine if an interval coverage meets the `cov_*`> `prop_samples_*` criteria
-        :return: Filtered interval coverage Table or MatrixTable
+        :return: Table of high coverage intervals
         """
         prop_samples_dict = {
             "chrX": (x_cov, prop_samples_x),
@@ -339,17 +352,13 @@ def compute_sex(
         filter_expr = functools.reduce(
             operator._or,
             [
-                (coverage_t.interval.start.contig == contig)
-                & agg_func(coverage_t[f"over_{cov}x"] > prop_samples)
+                (coverage_mt.interval.start.contig == contig)
+                & agg_func(coverage_mt[f"{prefix}over_{cov}x"] > prop_samples)
                 for contig, (cov, prop_samples) in prop_samples_dict.items()
             ],
         )
 
-        return (
-            coverage_t.filter(filter_expr)
-            if isinstance(coverage_t, hl.Table)
-            else coverage_t.filter_rows(filter_expr)
-        )
+        return coverage_mt.filter_rows(filter_expr).rows()
 
     def _annotate_sex(vds, calling_intervals_ht):
         """
@@ -372,12 +381,6 @@ def compute_sex(
             variants_only_y_ploidy=variant_depth_only_y_ploidy,
         )
 
-    if platform_ht is not None:
-        logger.info("Collecting platform list...")
-        platforms = platform_ht.aggregate(
-            hl.agg.collect_as_set(platform_ht.qc_platform)
-        )
-
     if high_cov_intervals or high_cov_by_platform_all:
         logger.info(
             "Running sex ploidy and sex karyotype estimation using only high coverage intervals: %d percent of samples "
@@ -392,87 +395,58 @@ def compute_sex(
             normalization_contig,
         )
 
-        if per_platform:
-            logger.info(
-                "Running sex ploidy and sex karyotype estimation per platform using per platform "
-                "high coverage intervals..."
-            )
-            per_platform_sex_hts = []
-            x_ploidy_cutoffs = {}
-            y_ploidy_cutoffs = {}
-            for platform in platforms:
-                ht = platform_ht.filter(platform_ht.qc_platform == platform)
-                logger.info("Platform %s has %d samples...", platform, ht.count())
-                coverage_platform_mt = _get_filtered_coverage_t(
-                    coverage_mt.filter_cols(coverage_mt.platform == platform)
+    if per_platform:
+        logger.info(
+            "Running sex ploidy and sex karyotype estimation per platform %s...",
+            "using per platform high coverage intervals" if high_cov_intervals else ""
+        )
+        platforms = platform_ht.aggregate(
+            hl.agg.collect_as_set(platform_ht.qc_platform)
+        )
+        per_platform_sex_hts = []
+        x_ploidy_cutoffs = {}
+        y_ploidy_cutoffs = {}
+
+        for platform in platforms:
+            logger.info("Performing estimation for platform %s...", platform)
+            if high_cov_intervals:
+                calling_intervals_ht = _get_high_coverage_intervals_ht(
+                    coverage_mt.filter_cols(coverage_mt.platform == platform),
+                    prefix="platform_"
                 )
-                calling_intervals_ht = coverage_platform_mt.rows()
-                sex_ht = _annotate_sex(
-                    hl.vds.filter_samples(vds, ht), calling_intervals_ht
-                )
-                sex_ht = sex_ht.annotate(platform=platform)
-                per_platform_sex_hts.append(sex_ht)
-                x_ploidy_cutoffs[platform] = sex_ht.index_globals().x_ploidy_cutoffs
-                y_ploidy_cutoffs[platform] = sex_ht.index_globals().y_ploidy_cutoffs
-            sex_ht = per_platform_sex_hts[0].union(*per_platform_sex_hts[1:])
-            sex_ht = sex_ht.annotate_globals(
-                x_ploidy_cutoffs=hl.struct(**x_ploidy_cutoffs),
-                y_ploidy_cutoffs=hl.struct(**y_ploidy_cutoffs),
+            else:
+                calling_intervals_ht = coverage_mt.rows()
+            sex_ht = _annotate_sex(
+                hl.vds.filter_samples(vds, platform_ht.filter(platform_ht.qc_platform == platform)),
+                calling_intervals_ht
             )
-        elif high_cov_by_platform_all:
-            logger.info(
-                "Running sex ploidy and sex karyotype estimation using high coverage intervals across all platforms. "
-                "Limited to platforms with at least %s samples...",
-                min_platform_size,
-            )
-            platform_n_ht = platform_ht.group_by(platform_ht.qc_platform).aggregate(
-                n_samples=hl.agg.count()
-            )
-            coverage_mt = coverage_mt.annotate_cols(
-                n_samples=platform_n_ht[coverage_mt.col_key].n_samples
-            )
-            coverage_mt = coverage_mt.filter_cols(
-                coverage_mt.n_samples >= min_platform_size
-            )
-            coverage_mt = _get_filtered_coverage_t(coverage_mt)
-            calling_intervals_ht = coverage_mt.rows()
-            sex_ht = _annotate_sex(vds, calling_intervals_ht)
-        else:
-            logger.info(
-                "Running sex ploidy and sex karyotype estimation using high coverage intervals across the full sample set..."
-            )
-            coverage_ht = coverage_mt.rows()
-            coverage_ht = coverage_ht.select(**coverage_ht.prop_samples_by_dp)
-            coverage_mt = _get_filtered_coverage_t(coverage_ht, lambda x: x)
-            calling_intervals_ht = coverage_mt.rows()
-            sex_ht = _annotate_sex(vds, calling_intervals_ht)
+            sex_ht = sex_ht.annotate(platform=platform)
+            per_platform_sex_hts.append(sex_ht)
+            x_ploidy_cutoffs[platform] = sex_ht.index_globals().x_ploidy_cutoffs
+            y_ploidy_cutoffs[platform] = sex_ht.index_globals().y_ploidy_cutoffs
+        sex_ht = per_platform_sex_hts[0].union(*per_platform_sex_hts[1:])
+        sex_ht = sex_ht.annotate_globals(
+            x_ploidy_cutoffs=hl.struct(**x_ploidy_cutoffs),
+            y_ploidy_cutoffs=hl.struct(**y_ploidy_cutoffs),
+        )
+    elif high_cov_by_platform_all:
+        logger.info(
+            "Running sex ploidy and sex karyotype estimation using high coverage intervals across all platforms. "
+            "Limited to platforms with at least %s samples...",
+            min_platform_size,
+        )
+        coverage_mt = coverage_mt.filter_cols(coverage_mt.n_samples >= min_platform_size)
+        calling_intervals_ht = _get_high_coverage_intervals_ht(coverage_mt, prefix="platform_")
+        sex_ht = _annotate_sex(vds, calling_intervals_ht)
+    elif high_cov_intervals:
+        logger.info(
+             "Running sex ploidy and sex karyotype estimation using high coverage intervals across the full sample set..."
+        )
+        calling_intervals_ht = _get_high_coverage_intervals_ht(coverage_mt, lambda x: x)
+        sex_ht = _annotate_sex(vds, calling_intervals_ht)
     else:
-        calling_intervals_ht = coverage_mt.rows()
-        if per_platform:
-            logger.info(
-                "Running sex ploidy estimation and per platform sex karyotype estimation..."
-            )
-            per_platform_sex_hts = []
-            x_ploidy_cutoffs = {}
-            y_ploidy_cutoffs = {}
-            for platform in platforms:
-                ht = platform_ht.filter(platform_ht.qc_platform == platform)
-                logger.info("Platform %s has %d samples...", platform, ht.count())
-                sex_ht = _annotate_sex(
-                    hl.vds.filter_samples(vds, ht), calling_intervals_ht
-                )
-                sex_ht = sex_ht.annotate(platform=platform)
-                per_platform_sex_hts.append(sex_ht)
-                x_ploidy_cutoffs[platform] = sex_ht.index_globals().x_ploidy_cutoffs
-                y_ploidy_cutoffs[platform] = sex_ht.index_globals().y_ploidy_cutoffs
-            sex_ht = per_platform_sex_hts[0].union(*per_platform_sex_hts[1:])
-            sex_ht = sex_ht.annotate_globals(
-                x_ploidy_cutoffs=hl.struct(**x_ploidy_cutoffs),
-                y_ploidy_cutoffs=hl.struct(**y_ploidy_cutoffs),
-            )
-        else:
-            logger.info("Running sex ploidy and sex karyotype estimation...")
-            sex_ht = _annotate_sex(vds, calling_intervals_ht)
+        logger.info("Running sex ploidy and sex karyotype estimation...")
+        sex_ht = _annotate_sex(vds, coverage_mt.rows())
 
     sex_ht = sex_ht.annotate_globals(
         high_cov_intervals=high_cov_intervals,
@@ -498,12 +472,16 @@ def compute_sex(
 def main(args):
     hl.init(log="/sex_inference.log", default_reference="GRCh38")
 
+    test = args.test
+    calling_interval_name = args.calling_interval_name
+    calling_interval_padding = args.calling_interval_padding
+
     try:
         if args.determine_fstat_sites:
             vds = get_gnomad_v4_vds(
                 remove_hard_filtered_samples=False,
                 remove_hard_filtered_samples_no_sex=True,
-                test=args.test,
+                test=test,
             )
             ht = determine_fstat_sites(
                 vds,
@@ -513,12 +491,13 @@ def main(args):
             )
             ht.write(
                 get_checkpoint_path("test_f_stat_sites")
-                if args.test
+                if test
                 else f_stat_sites.path,
                 overwrite=args.overwrite,
             )
+
         if args.sex_imputation_interval_qc:
-            coverage_mt = load_coverage_mt(args.test, args.calling_interval_name, args.calling_interval_padding)
+            coverage_mt = load_coverage_mt(test, calling_interval_name, calling_interval_padding)
             logger.info(
                 "Filtering interval coverage MatrixTable to chrX, chrY and %s...",
                 args.normalization_contig,
@@ -528,18 +507,19 @@ def main(args):
                 [hl.parse_locus_interval(contig) for contig in ["chrX", "chrY", args.normalization_contig]],
             )
             
-            platform_ht = load_platform_ht(args.test, args.calling_interval_name, args.calling_interval_padding)
+            platform_ht = load_platform_ht(test, calling_interval_name, calling_interval_padding)
             coverage_mt = generate_sex_imputation_coverage_mt(
                 coverage_mt,
                 platform_ht,
                 mean_dp_thresholds=args.mean_dp_thresholds,
             )
             coverage_mt.write(sex_imputation_coverage.path, overwrite=args.overwrite)
+
         if args.impute_sex:
             vds = get_gnomad_v4_vds(
                 remove_hard_filtered_samples=False,
                 remove_hard_filtered_samples_no_sex=True,
-                test=args.test,
+                test=test,
             )
             if args.f_stat_ukbb_var:
                 # The UK Biobank f-stat table contains only variants that were high callrate (0.99) and common
@@ -550,13 +530,13 @@ def main(args):
             else:
                 freq_ht = (
                     hl.read_table(get_checkpoint_path("test_f_stat_sites"))
-                    if args.test
+                    if test
                     else f_stat_sites.ht()
                 )
 
             # Added because without this impute_sex_chromosome_ploidy will still run even with overwrite=False
             if args.overwrite or not file_exists(
-                get_checkpoint_path("sex_imputation") if args.test else sex.path
+                get_checkpoint_path("sex_imputation") if test else sex.path
             ):
                 if (
                     args.high_cov_intervals
@@ -566,6 +546,7 @@ def main(args):
                     coverage_mt = sex_imputation_coverage.mt()
                 else:
                     coverage_mt = interval_coverage.mt()
+
                 ht = compute_sex(
                     vds,
                     coverage_mt,
@@ -597,7 +578,7 @@ def main(args):
                         f"{'.high_cov' if args.high_cov_intervals else ''}"
                         f"{'.ukbb_f_stat' if args.f_stat_ukbb_var else ''}"
                     )
-                    if args.test
+                    if test
                     else sex.path,
                     overwrite=True,
                 )
@@ -606,7 +587,6 @@ def main(args):
     finally:
         logger.info("Copying log to logging bucket...")
         hl.copy_log(get_logging_path("sex_inference"))
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

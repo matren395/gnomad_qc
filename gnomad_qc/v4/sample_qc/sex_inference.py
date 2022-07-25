@@ -58,7 +58,6 @@ def determine_fstat_sites(
     :param min_callrate: Callrate cutoff used to filter sites
     :return: Table of chromosome X sites to be used for f-stat computation
     """
-
     vds = hl.vds.filter_chromosomes(vds, keep=["chrX"])
     vd = vds.variant_data
     vd = vd.filter_rows(

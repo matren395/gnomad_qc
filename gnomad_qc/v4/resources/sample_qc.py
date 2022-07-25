@@ -286,7 +286,7 @@ sex_imputation_coverage = VersionedMatrixTableResource(
     },
 )
 
-# Sex imputation results
+"""# Sex imputation results
 sex = VersionedTableResource(
     CURRENT_VERSION,
     {
@@ -295,7 +295,19 @@ sex = VersionedTableResource(
         )
         for version in VERSIONS
     },
-)
+)"""
+
+
+def get_sex(name):
+    return VersionedTableResource(
+        CURRENT_VERSION,
+        {
+            version: TableResource(
+                f"{get_sample_qc_root(version)}/sex_inference_testing/gnomad.exomes.v{version}.sex.{name}.ht"
+            )
+            for version in VERSIONS
+        }
+    )
 
 # Samples to drop for PCA due to them being related
 pca_related_samples_to_drop = VersionedTableResource(

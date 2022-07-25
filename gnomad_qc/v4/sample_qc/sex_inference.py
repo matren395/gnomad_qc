@@ -43,7 +43,7 @@ def determine_fstat_sites(
 
     .. warning::
 
-        By default `approx_af_and_no_callrate` is False and the final Table will be filter to high callrate (> value
+        By default `approx_af_and_no_callrate` is False and the final Table will be filtered to high callrate (> value
         specified by `min_callrate`) variants. This requires a densify of chrX!!"
 
     .. note::
@@ -55,7 +55,7 @@ def determine_fstat_sites(
     :param approx_af_and_no_callrate: Whether to approximate allele frequency with AC/(n_samples * 2) and use no
         callrate cutoff to filter sites
     :param min_af: Alternate allele frequency cutoff used to filter sites
-    :param min_callrate: Call rate cutoff used to filter sites
+    :param min_callrate: Callrate cutoff used to filter sites
     :return: Table of chromosome X sites to be used for f-stat computation
     """
 
@@ -89,20 +89,23 @@ def determine_fstat_sites(
             min_callrate=min_callrate,
         )
 
-    return ht.naive_coalesce(1000)
+    return ht
 
 
 def load_platform_ht(
     test: bool = False,
     calling_interval_name: str = "intersection",
     calling_interval_padding: int = 50,
-):
+) -> hl.Table:
     """
+    Load platform assignment Table or test Table and return an error if requested Table does not exist.
 
-    :param test:
-    :param calling_interval_name:
-    :param calling_interval_padding:
-    :return:
+    :param test: Whether a test platform assignment Table should be loaded if the final platform assignment Table doesn't exist
+    :param calling_interval_name: Name of calling intervals to use for interval coverage. One of: 'ukb', 'broad', or
+        'intersection'. Only used if `test` is True and the final platform assignment Table is not already written
+    :param calling_interval_padding: Number of base pair padding to use on the calling intervals. One of 0 or 50 bp.
+        Only used if `test` is True and the final platform assignment Table is not already written
+    :return: Platform Table
     """
     logger.info("Loading platform information...")
     if file_exists(platform.path):
@@ -134,13 +137,16 @@ def load_coverage_mt(
     test: bool = False,
     calling_interval_name: str = "intersection",
     calling_interval_padding: int = 50,
-):
+) -> hl.Table:
     """
+    Load interval coverage MatrixTable or test MatrixTable and return an error if requested MatrixTable does not exist.
 
-    :param test:
-    :param calling_interval_name:
-    :param calling_interval_padding:
-    :return:
+    :param test: Whether a test interval coverage MatrixTable should be loaded if the final Table doesn't exist
+    :param calling_interval_name: Name of calling intervals to use for interval coverage. One of: 'ukb', 'broad', or
+        'intersection'. Only used if `test` is True and the final coverage MatrixTable is not already written
+    :param calling_interval_padding: Number of base pair padding to use on the calling intervals. One of 0 or 50 bp.
+        Only used if `test` is True and the final coverage MatrixTable is not already written
+    :return: Interval coverage Table
     """
     logger.info("Loading interval coverage MatrixTable...")
     if file_exists(interval_coverage.path):
@@ -168,7 +174,7 @@ def load_coverage_mt(
     return mt
 
 
-def generate_sex_imputation_coverage_mt(
+def generate_sex_imputation_interval_qc_mt(
     mt: hl.MatrixTable,
     platform_ht: hl.Table,
     contigs: List[str] = ["chrX", "chrY", "chr20"],
@@ -180,8 +186,8 @@ def generate_sex_imputation_coverage_mt(
     :param mt: Input interval coverage MatrixTable
     :param platform_ht: Input platform assignment Table
     :param contigs: Which contigs to filter to before computing the fraction of sample over DP thresholds
-    :param mean_dp_thresholds: List of mean DP cutoffs to determining the fraction of samples with mean coverage >= the
-        cutoff for each interval
+    :param mean_dp_thresholds: List of mean DP thresholds to use for computing the fraction of samples with mean
+        interval DP >= the threshold
     :return: Table with annotations for the fraction of samples per interval and per platform over DP thresholds
     """
     logger.info(
@@ -213,10 +219,10 @@ def generate_sex_imputation_coverage_mt(
     mt = mt.select_globals(
         "calling_interval_name",
         "calling_interval_padding",
-        mean_dp_thresholds=mean_dp_thresholds
+        mean_dp_thresholds=mean_dp_thresholds,
     )
 
-    return mt.naive_coalesce(500)
+    return mt
 
 
 def compute_sex(
@@ -355,8 +361,10 @@ def compute_sex(
         `prop_samples_y`, and `prop_samples_norm`.
 
         :param coverage_mt: Input interval coverage MatrixTable
-        :param prefix: Prefix of aggregate coverage annotation
-        :param agg_func: Hail aggregation function to determine if an interval coverage meets the `cov_*`> `prop_samples_*` criteria
+        :param prefix: Prefix of annotations in `coverage_mt` that contain the proportion of samples with mean DP over
+            coverage cutoffs
+        :param agg_func: Hail aggregation function to determine if an interval coverage meets the
+            `cov_*` > `prop_samples_*` criteria
         :return: Table of high coverage intervals
         """
         prop_samples_dict = {
@@ -513,7 +521,7 @@ def main(args):
                 min_af=args.min_af,
                 min_callrate=args.min_callrate,
             )
-            ht.write(
+            ht.naive_coalesce(args.fstats_n_partitions).write(
                 get_checkpoint_path("test_f_stat_sites") if test else f_stat_sites.path,
                 overwrite=args.overwrite,
             )
@@ -525,13 +533,13 @@ def main(args):
             platform_ht = load_platform_ht(
                 test, calling_interval_name, calling_interval_padding
             )
-            coverage_mt = generate_sex_imputation_coverage_mt(
+            coverage_mt = generate_sex_imputation_interval_qc_mt(
                 coverage_mt,
                 platform_ht,
                 contigs=["chrX", "chrY", normalization_contig],
                 mean_dp_thresholds=args.mean_dp_thresholds,
             )
-            coverage_mt.write(
+            coverage_mt.naive_coalesce(args.interval_qc_n_partitions).write(
                 get_checkpoint_path("test_sex_imputation_cov", mt=True)
                 if test
                 else sex_imputation_coverage.path,
@@ -560,24 +568,26 @@ def main(args):
                     else f_stat_sites.ht()
                 )
 
+            sex_ht_path = (
+                get_checkpoint_path(
+                    f"sex_imputation{'.per_platform' if args.per_platform else ''}"
+                    f"{'.high_cov_by_platform_all' if args.high_cov_by_platform_all else ''}"
+                    f"{'.high_cov' if args.high_cov_intervals else ''}"
+                    f"{'.ukbb_f_stat' if args.f_stat_ukbb_var else ''}"
+                )
+                if test
+                else sex.path
+            )
+
             # Added because without this impute_sex_chromosome_ploidy will still run even with overwrite=False
-            if args.overwrite or not file_exists(
-                get_checkpoint_path("sex_imputation") if test else sex.path
-            ):
-                if (
-                    args.high_cov_intervals
-                    or args.per_platform
-                    or args.high_cov_by_platform_all
-                ):
-                    coverage_mt = (
-                        hl.read_matrix_table(
-                            get_checkpoint_path("test_sex_imputation_cov", mt=True)
-                        )
-                        if test
-                        else sex_imputation_coverage.mt()
+            if args.overwrite or not file_exists(sex_ht_path):
+                coverage_mt = (
+                    hl.read_matrix_table(
+                        get_checkpoint_path("test_sex_imputation_cov", mt=True)
                     )
-                else:
-                    coverage_mt = interval_coverage.mt()
+                    if test
+                    else sex_imputation_coverage.mt()
+                )
 
                 ht = compute_sex(
                     vds,
@@ -603,17 +613,8 @@ def main(args):
                 ht = ht.annotate_globals(
                     f_stat_ukbb_var=args.f_stat_ukbb_var,
                 )
-                ht.write(
-                    get_checkpoint_path(
-                        f"sex_imputation{'.per_platform' if args.per_platform else ''}"
-                        f"{'.high_cov_by_platform_all' if args.high_cov_by_platform_all else ''}"
-                        f"{'.high_cov' if args.high_cov_intervals else ''}"
-                        f"{'.ukbb_f_stat' if args.f_stat_ukbb_var else ''}"
-                    )
-                    if test
-                    else sex.path,
-                    overwrite=True,
-                )
+                logger.info("Writing sex inference Table...")
+                ht.write(sex_ht_path, overwrite=True)
             else:
                 logger.warning("File exists and overwrite is not set!")
     finally:
@@ -651,9 +652,24 @@ if __name__ == "__main__":
         action="store_true",
     )
     parser.add_argument(
+        "--fstat-n-partitions",
+        help="Number of desired partitions for the f-stat sites output Table.",
+        default=1000,
+        type=int,
+    )
+    parser.add_argument(
         "--sex-imputation-interval-qc",
-        help="",
+        help=(
+            "Create a Table of the fraction of samples per interval and per platform with mean DP over thresholds "
+            "specified by '--mean-dp-thresholds'."
+        ),
         action="store_true",
+    )
+    parser.add_argument(
+        "--interval-qc-n-partitions",
+        help="Number of desired partitions for the sex imputation interval QC output Table.",
+        default=500,
+        type=int,
     )
     parser.add_argument(
         "--normalization-contig",

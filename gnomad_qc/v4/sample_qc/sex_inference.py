@@ -83,13 +83,13 @@ def determine_fstat_sites(
         ht = ht.filter(
             (ht.variant_qc.call_rate > min_callrate) & (ht.variant_qc.AF[1] > min_af)
         )
-        ht = ht.transmute(AF=ht.variant_qc.AF[1])
+        ht = ht.annotate(AF=ht.variant_qc.AF[1])
         ht = ht.annotate_globals(
             min_af=min_af,
             min_callrate=min_callrate,
         )
 
-    return ht
+    return ht.naive_coalesce(1000)
 
 
 def load_platform_ht(
@@ -117,14 +117,14 @@ def load_platform_ht(
             raise FileNotFoundError(
                 f"There is no final platform assignment Table written and a test platform assignment Table "
                 f"does not exist for calling interval {calling_interval_name} and interval padding "
-                f"{calling_interval_padding}. Please run platform_inference.py --assign_platforms "
-                f"with the --test argument and needed --calling_interval_name/--calling_interval_padding "
+                f"{calling_interval_padding}. Please run platform_inference.py --assign-platforms "
+                f"with the --test argument and needed --calling-interval-name/--calling-interval-padding "
                 f"arguments."
             )
     else:
         raise FileNotFoundError(
             f"There is no final platform assignment Table written. Please run: "
-            f"platform_inference.py --assign_platforms to compute the platform assignment Table."
+            f"platform_inference.py --assign-platforms to compute the platform assignment Table."
         )
 
     return ht
@@ -156,13 +156,13 @@ def load_coverage_mt(
             raise FileNotFoundError(
                 f"There is no final coverage MatrixTable written and a test interval coverage MatrixTable does "
                 f"not exist for calling interval {calling_interval_name} and interval padding "
-                f"{calling_interval_padding}. Please run platform_inference.py --compute_coverage with the "
-                f"--test argument and needed --calling_interval_name/--calling_interval_padding arguments."
+                f"{calling_interval_padding}. Please run hard_filters.py --compute-coverage with the "
+                f"--test argument and needed --calling-interval-name/--calling-interval-padding arguments."
             )
     else:
         raise FileNotFoundError(
             f"There is no final coverage MatrixTable written. Please run: "
-            f"platform_inference.py --compute_coverage to compute the interval coverage MatrixTable."
+            f"hard_filters.py --compute-coverage to compute the interval coverage MatrixTable."
         )
 
     return mt
@@ -210,9 +210,13 @@ def generate_sex_imputation_coverage_mt(
         n_samples=hl.agg.count()
     )
     mt = mt.annotate_cols(n_samples=platform_ht[mt.col_key].n_samples)
-    mt = mt.annotate_globals(mean_dp_thresholds=mean_dp_thresholds)
+    mt = mt.select_globals(
+        "calling_interval_name",
+        "calling_interval_padding",
+        mean_dp_thresholds=mean_dp_thresholds
+    )
 
-    return mt
+    return mt.naive_coalesce(500)
 
 
 def compute_sex(
@@ -361,7 +365,7 @@ def compute_sex(
             normalization_contig: (norm_cov, prop_samples_norm),
         }
         filter_expr = functools.reduce(
-            operator._or,
+            operator.or_,
             [
                 (coverage_mt.interval.start.contig == contig)
                 & agg_func(coverage_mt[f"{prefix}over_{cov}x"] > prop_samples)
@@ -459,7 +463,9 @@ def compute_sex(
         logger.info(
             "Running sex ploidy and sex karyotype estimation using high coverage intervals across the full sample set..."
         )
-        calling_intervals_ht = _get_high_coverage_intervals_ht(coverage_mt, lambda x: x)
+        calling_intervals_ht = _get_high_coverage_intervals_ht(
+            coverage_mt, agg_func=lambda x: x
+        )
         sex_ht = _annotate_sex(vds, calling_intervals_ht)
     else:
         logger.info("Running sex ploidy and sex karyotype estimation...")
@@ -537,6 +543,9 @@ def main(args):
                 remove_hard_filtered_samples=False,
                 remove_hard_filtered_samples_no_sex=True,
                 test=test,
+            )
+            platform_ht = load_platform_ht(
+                test, calling_interval_name, calling_interval_padding
             )
             if args.f_stat_ukbb_var:
                 # The UK Biobank f-stat table contains only variants that were high callrate (0.99) and common

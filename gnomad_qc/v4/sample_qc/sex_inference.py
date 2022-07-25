@@ -586,10 +586,8 @@ def main(args):
                     f"{'.high_cov_by_platform_all' if args.high_cov_by_platform_all else ''}"
                     f"{'.high_cov' if args.high_cov_intervals else ''}"
                     f"{'.ukbb_f_stat' if args.f_stat_ukbb_var else ''}"
-                    f"2"
-                )
+                ).path
             )  # sex.path,
-
             # Added because without this impute_sex_chromosome_ploidy will still run even with overwrite=False
             if args.overwrite or not file_exists(sex_ht_path):
                 coverage_mt = (

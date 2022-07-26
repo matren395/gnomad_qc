@@ -445,6 +445,7 @@ def compute_sex(
                 calling_intervals_ht,
             )
             sex_ht = sex_ht.annotate(platform=platform)
+            sex_ht = sex_ht.checkpoint(get_checkpoint_path(f"sex_imputation_{platform}"), overwrite=True)
             per_platform_sex_hts.append(sex_ht)
             x_ploidy_cutoffs[platform] = sex_ht.index_globals().x_ploidy_cutoffs
             y_ploidy_cutoffs[platform] = sex_ht.index_globals().y_ploidy_cutoffs
@@ -453,7 +454,7 @@ def compute_sex(
             x_ploidy_cutoffs=hl.struct(**x_ploidy_cutoffs),
             y_ploidy_cutoffs=hl.struct(**y_ploidy_cutoffs),
         )
-    elif high_cov_by_platform_all:
+    elif high_cov_by_platform_all:  # TODO: exclude platform -1?
         logger.info(
             "Running sex ploidy and sex karyotype estimation using high coverage intervals across all platforms. "
             "Limited to platforms with at least %s samples...",

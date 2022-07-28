@@ -454,14 +454,14 @@ def compute_sex(
             x_ploidy_cutoffs=hl.struct(**x_ploidy_cutoffs),
             y_ploidy_cutoffs=hl.struct(**y_ploidy_cutoffs),
         )
-    elif high_cov_by_platform_all:  # TODO: exclude platform -1?
+    elif high_cov_by_platform_all:
         logger.info(
             "Running sex ploidy and sex karyotype estimation using high coverage intervals across all platforms. "
             "Limited to platforms with at least %s samples...",
             min_platform_size,
         )
         coverage_mt = coverage_mt.filter_cols(
-            coverage_mt.n_samples >= min_platform_size
+            (coverage_mt.n_samples >= min_platform_size) & (coverage_mt.platform != "platform_-1")
         )
         calling_intervals_ht = _get_high_coverage_intervals_ht(
             coverage_mt, prefix="platform_"

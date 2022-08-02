@@ -394,7 +394,7 @@ def compute_sex(
             vds,
             included_intervals=calling_intervals_ht,
             normalization_contig=normalization_contig,
-            sites_ht=freq_ht.filter(hl.is_defined(calling_intervals_ht[freq_ht.key]))
+            sites_ht=freq_ht.filter(hl.is_defined(calling_intervals_ht[freq_ht.locus]))
             if freq_ht is not None
             else None,
             aaf_expr="AF",
@@ -588,6 +588,7 @@ def main(args):
                 )
                 if test
                 else get_sex(
+                    f".fstat_in_intervals"
                     f"{'.per_platform' if args.per_platform else ''}"
                     f"{'.high_cov_by_platform_all' if args.high_cov_by_platform_all else ''}"
                     f"{'.high_cov' if args.high_cov_intervals else ''}"

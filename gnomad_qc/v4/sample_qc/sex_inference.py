@@ -241,7 +241,7 @@ def compute_sex(
     prop_samples_x: float = None,
     prop_samples_y: float = None,
     prop_samples_norm: float = None,
-    freq_ht=None,
+    freq_ht: hl.Table = None,
     min_af: float = 0.001,
     f_stat_cutoff: float = 0.5,
 ) -> hl.Table:
@@ -394,7 +394,9 @@ def compute_sex(
             vds,
             included_intervals=calling_intervals_ht,
             normalization_contig=normalization_contig,
-            sites_ht=freq_ht,
+            sites_ht=freq_ht.filter(hl.is_defined(calling_intervals_ht[freq_ht.key]))
+            if freq_ht is not None
+            else None,
             aaf_expr="AF",
             gt_expr="LGT",
             f_stat_cutoff=f_stat_cutoff,
@@ -445,7 +447,9 @@ def compute_sex(
                 calling_intervals_ht,
             )
             sex_ht = sex_ht.annotate(platform=platform)
-            sex_ht = sex_ht.checkpoint(get_checkpoint_path(f"sex_imputation_{platform}"), overwrite=True)
+            sex_ht = sex_ht.checkpoint(
+                get_checkpoint_path(f"sex_imputation_{platform}"), overwrite=True
+            )
             per_platform_sex_hts.append(sex_ht)
             x_ploidy_cutoffs[platform] = sex_ht.index_globals().x_ploidy_cutoffs
             y_ploidy_cutoffs[platform] = sex_ht.index_globals().y_ploidy_cutoffs
@@ -461,7 +465,8 @@ def compute_sex(
             min_platform_size,
         )
         coverage_mt = coverage_mt.filter_cols(
-            (coverage_mt.n_samples >= min_platform_size) & (coverage_mt.platform != "platform_-1")
+            (coverage_mt.n_samples >= min_platform_size)
+            & (coverage_mt.platform != "platform_-1")
         )
         calling_intervals_ht = _get_high_coverage_intervals_ht(
             coverage_mt, prefix="platform_"

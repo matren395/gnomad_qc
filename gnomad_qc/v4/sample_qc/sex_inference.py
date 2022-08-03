@@ -12,6 +12,7 @@ from gnomad.utils.slack import slack_notifications
 
 from gnomad_qc.slack_creds import slack_token
 from gnomad_qc.v4.resources.basics import (
+    calling_intervals,
     get_checkpoint_path,
     get_gnomad_v4_vds,
     get_logging_path,
@@ -21,7 +22,7 @@ from gnomad_qc.v4.resources.sample_qc import (
     f_stat_sites,
     interval_coverage,
     platform,
-    get_sex, #sex,
+    get_sex,  # sex,
     sex_imputation_coverage,
 )
 
@@ -174,7 +175,8 @@ def load_coverage_mt(
 
 
 def generate_sex_imputation_interval_qc_mt(
-    mt: hl.MatrixTable,
+    vds: hl.vds.VariantDataset,
+    calling_intervals_ht: hl.Table,
     platform_ht: hl.Table,
     contigs: List[str] = ["chrX", "chrY", "chr20"],
     mean_dp_thresholds: List[int] = [5, 10, 15, 20, 25],
@@ -189,6 +191,42 @@ def generate_sex_imputation_interval_qc_mt(
         interval DP >= the threshold
     :return: Table with annotations for the fraction of samples per interval and per platform over DP thresholds
     """
+    calling_intervals_ht = calling_intervals_ht.filter(
+        hl.literal(contigs).contains(calling_intervals_ht.interval.start.contig)
+    )
+    vds = hl.vds.filter_chromosomes(vds, keep=contigs)
+    rg = vds.reference_data.locus.dtype.reference_genome
+
+    par_boundaries = []
+    for par_interval in rg.par:
+        par_boundaries.append(par_interval.start)
+        par_boundaries.append(par_interval.end)
+
+    # segment on PAR interval boundaries
+    calling_intervals = hl.segment_intervals(calling_intervals_ht, par_boundaries)
+
+    # remove intervals overlapping PAR
+    calling_intervals = calling_intervals.filter(
+        hl.all(lambda x: ~x.overlaps(calling_intervals.interval), hl.literal(rg.par))
+    )
+
+    # checkpoint for efficient multiple downstream usages
+    logger.info("Checkpointing calling intervals")
+    calling_intervals = calling_intervals.checkpoint(
+        get_checkpoint_path("calling_intervals_sex_coverage"), overwrite=True
+    )
+
+    kept_contig_filter = hl.array(contigs).map(
+        lambda x: hl.parse_locus_interval(x, reference_genome=rg)
+    )
+    vds = hl.vds.VariantDataset(
+        hl.filter_intervals(vds.reference_data, kept_contig_filter),
+        hl.filter_intervals(vds.variant_data, kept_contig_filter),
+    )
+    mt = hl.vds.interval_coverage(vds, calling_intervals, gq_thresholds=()).drop(
+        "gq_thresholds"
+    )
+
     logger.info(
         "Filtering interval coverage MatrixTable to the following contigs: %s...",
         ", ".join(contigs),
@@ -215,11 +253,7 @@ def generate_sex_imputation_interval_qc_mt(
         n_samples=hl.agg.count()
     )
     mt = mt.annotate_cols(n_samples=platform_ht[mt.col_key].n_samples)
-    mt = mt.select_globals(
-        "calling_interval_name",
-        "calling_interval_padding",
-        mean_dp_thresholds=mean_dp_thresholds,
-    )
+    mt = mt.select_globals(mean_dp_thresholds=mean_dp_thresholds)
 
     return mt
 
@@ -538,17 +572,27 @@ def main(args):
             )
 
         if args.sex_imputation_interval_qc:
-            coverage_mt = load_coverage_mt(
-                test, calling_interval_name, calling_interval_padding
+            vds = get_gnomad_v4_vds(
+                remove_hard_filtered_samples=False,
+                remove_hard_filtered_samples_no_sex=True,
+                test=test,
             )
+            calling_intervals_ht = calling_intervals(
+                calling_interval_name, calling_interval_padding
+            ).ht()
             platform_ht = load_platform_ht(
                 test, calling_interval_name, calling_interval_padding
             )
             coverage_mt = generate_sex_imputation_interval_qc_mt(
-                coverage_mt,
+                vds,
+                calling_intervals_ht,
                 platform_ht,
                 contigs=["chrX", "chrY", normalization_contig],
                 mean_dp_thresholds=args.mean_dp_thresholds,
+            )
+            coverage_mt = coverage_mt.annotate_globals(
+                calling_interval_name=calling_interval_name,
+                calling_interval_padding=calling_interval_padding,
             )
             coverage_mt.naive_coalesce(args.interval_qc_n_partitions).write(
                 get_checkpoint_path("test_sex_imputation_cov", mt=True)

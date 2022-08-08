@@ -286,6 +286,17 @@ sex_imputation_coverage = VersionedMatrixTableResource(
     },
 )
 
+# Sex imputation coverage aggregate stats per platform MT
+sex_imputation_platform_coverage = VersionedMatrixTableResource(
+    CURRENT_VERSION,
+    {
+        version: MatrixTableResource(
+            f"{get_sample_qc_root(version)}/gnomad.exomes.v{version}.sex_imputation_coverage.per_platform.mt"
+        )
+        for version in VERSIONS
+    },
+)
+
 """# Sex imputation results
 sex = VersionedTableResource(
     CURRENT_VERSION,

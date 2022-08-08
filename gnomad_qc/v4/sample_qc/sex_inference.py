@@ -24,6 +24,7 @@ from gnomad_qc.v4.resources.sample_qc import (
     platform,
     get_sex,  # sex,
     sex_imputation_coverage,
+    sex_imputation_platform_coverage,
 )
 
 logging.basicConfig(format="%(levelname)s (%(name)s %(lineno)s): %(message)s")
@@ -180,7 +181,7 @@ def generate_sex_imputation_interval_qc_mt(
     platform_ht: hl.Table,
     contigs: List[str] = ["chrX", "chrY", "chr20"],
     mean_dp_thresholds: List[int] = [5, 10, 15, 20, 25],
-) -> hl.Table:
+) -> hl.MatrixTable:
     """
     Create a Table of fraction of samples per interval and per platform with mean DP over specified thresholds.
 
@@ -240,9 +241,10 @@ def generate_sex_imputation_interval_qc_mt(
             for dp in mean_dp_thresholds
         }
     )
+    mt = mt.select_globals(mean_dp_thresholds=mean_dp_thresholds)
 
     logger.info("Adding per platform aggregation...")
-    mt = mt.group_cols_by(mt.platform).aggregate(
+    platform_mt = mt.group_cols_by(mt.platform).aggregate(
         **{
             f"platform_over_{dp}x": hl.agg.fraction(mt.mean_dp >= dp)
             for dp in mean_dp_thresholds
@@ -252,15 +254,15 @@ def generate_sex_imputation_interval_qc_mt(
     platform_ht = platform_ht.group_by(platform_ht.qc_platform).aggregate(
         n_samples=hl.agg.count()
     )
-    mt = mt.annotate_cols(n_samples=platform_ht[mt.col_key].n_samples)
-    mt = mt.select_globals(mean_dp_thresholds=mean_dp_thresholds)
+    platform_mt = platform_mt.annotate_cols(n_samples=platform_ht[platform_mt.col_key].n_samples)
 
-    return mt
+    return mt, platform_mt
 
 
 def compute_sex(
     vds: hl.vds.VariantDataset,
     coverage_mt: hl.MatrixTable,
+    platform_coverage_mt: hl.MatrixTable = None,
     high_cov_intervals: bool = False,
     per_platform: bool = False,
     high_cov_by_platform_all: bool = False,
@@ -381,7 +383,7 @@ def compute_sex(
         )
 
     def _get_high_coverage_intervals_ht(
-        coverage_mt: hl.MatrixTable,
+        platform_coverage_mt: hl.MatrixTable,
         prefix: str = "",
         agg_func: Callable[
             [hl.expr.BooleanExpression], hl.BooleanExpression
@@ -393,9 +395,9 @@ def compute_sex(
         High coverage intervals are determined using `agg_func`, `x_cov`, `y_cov`, `norm_cov`, `prop_samples_x`,
         `prop_samples_y`, and `prop_samples_norm`.
 
-        :param coverage_mt: Input interval coverage MatrixTable
-        :param prefix: Prefix of annotations in `coverage_mt` that contain the proportion of samples with mean DP over
-            coverage cutoffs
+        :param platform_coverage_mt: Input interval coverage MatrixTable
+        :param prefix: Prefix of annotations in `platform_coverage_mt` that contain the proportion of samples with
+            mean DP over coverage cutoffs
         :param agg_func: Hail aggregation function to determine if an interval coverage meets the
             `cov_*` > `prop_samples_*` criteria
         :return: Table of high coverage intervals
@@ -408,20 +410,20 @@ def compute_sex(
         filter_expr = functools.reduce(
             operator.or_,
             [
-                (coverage_mt.interval.start.contig == contig)
-                & agg_func(coverage_mt[f"{prefix}over_{cov}x"] > prop_samples)
+                (platform_coverage_mt.interval.start.contig == contig)
+                & agg_func(platform_coverage_mt[f"{prefix}over_{cov}x"] > prop_samples)
                 for contig, (cov, prop_samples) in prop_samples_dict.items()
             ],
         )
 
-        return coverage_mt.filter_rows(filter_expr).rows()
+        return platform_coverage_mt.filter_rows(filter_expr).rows()
 
     def _annotate_sex(vds, calling_intervals_ht):
         """
         Helper function to perform `annotate_sex` using unchanged parameters with changes to the VDS and calling intervals.
 
         :param vds: Input VDS to use for sex annotation
-        :param calling_intervals_ht: Calling intervals to filter to for sex annotation
+        :param calling_intervals_ht: Coverage ht including only intervals wanted for sex annotation
         :return: Table containing sex annotation for samples in the input VDS
         """
         return annotate_sex(
@@ -437,6 +439,7 @@ def compute_sex(
             aaf_threshold=min_af,
             variants_only_x_ploidy=variant_depth_only_x_ploidy,
             variants_only_y_ploidy=variant_depth_only_y_ploidy,
+            coverage_mt=coverage_mt,
         )
 
     if high_cov_intervals or high_cov_by_platform_all:
@@ -469,11 +472,11 @@ def compute_sex(
             logger.info("Performing estimation for platform %s...", platform)
             if high_cov_intervals:
                 calling_intervals_ht = _get_high_coverage_intervals_ht(
-                    coverage_mt.filter_cols(coverage_mt.platform == platform),
+                    platform_coverage_mt.filter_cols(platform_coverage_mt.platform == platform),
                     prefix="platform_",
                 )
             else:
-                calling_intervals_ht = coverage_mt.rows()
+                calling_intervals_ht = platform_coverage_mt
             sex_ht = _annotate_sex(
                 hl.vds.filter_samples(
                     vds, platform_ht.filter(platform_ht.qc_platform == platform)
@@ -498,12 +501,12 @@ def compute_sex(
             "Limited to platforms with at least %s samples...",
             min_platform_size,
         )
-        coverage_mt = coverage_mt.filter_cols(
-            (coverage_mt.n_samples >= min_platform_size)
-            & (coverage_mt.platform != "platform_-1")
+        platform_coverage_mt = platform_coverage_mt.filter_cols(
+            (platform_coverage_mt.n_samples >= min_platform_size)
+            & (platform_coverage_mt.platform != "platform_-1")
         )
         calling_intervals_ht = _get_high_coverage_intervals_ht(
-            coverage_mt, prefix="platform_"
+            platform_coverage_mt, prefix="platform_"
         )
         sex_ht = _annotate_sex(vds, calling_intervals_ht)
     elif high_cov_intervals:
@@ -583,7 +586,7 @@ def main(args):
             platform_ht = load_platform_ht(
                 test, calling_interval_name, calling_interval_padding
             )
-            coverage_mt = generate_sex_imputation_interval_qc_mt(
+            coverage_mt, platform_mt = generate_sex_imputation_interval_qc_mt(
                 vds,
                 calling_intervals_ht,
                 platform_ht,
@@ -594,12 +597,24 @@ def main(args):
                 calling_interval_name=calling_interval_name,
                 calling_interval_padding=calling_interval_padding,
             )
-            coverage_mt.naive_coalesce(args.interval_qc_n_partitions).write(
+            platform_mt = platform_mt.annotate_globals(
+                calling_interval_name=calling_interval_name,
+                calling_interval_padding=calling_interval_padding,
+            )
+            coverage_mt = coverage_mt.checkpoint(
                 get_checkpoint_path("test_sex_imputation_cov", mt=True)
                 if test
                 else sex_imputation_coverage.path,
                 overwrite=args.overwrite,
             )
+            platform_mt.naive_coalesce(args.interval_qc_n_partitions).write(
+                get_checkpoint_path("test_sex_imputation_cov.per_platform", mt=True)
+                if test
+                else sex_imputation_platform_coverage.path,
+                overwrite=args.overwrite,
+            )
+            coverage_mt.describe()
+            platform_mt.describe()
 
         if args.impute_sex:
             vds = get_gnomad_v4_vds(
@@ -648,10 +663,18 @@ def main(args):
                     if test
                     else sex_imputation_coverage.mt()
                 )
+                platform_coverage_mt = (
+                    hl.read_matrix_table(
+                        get_checkpoint_path("test_sex_imputation_cov.per_platform", mt=True)
+                    )
+                    if test
+                    else sex_imputation_platform_coverage.mt()
+                )
 
                 ht = compute_sex(
                     vds,
                     coverage_mt,
+                    platform_coverage_mt,
                     args.high_cov_intervals,
                     args.per_platform,
                     args.high_cov_by_platform_all,

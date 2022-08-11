@@ -176,24 +176,62 @@ def load_coverage_mt(
 
 
 def generate_sex_imputation_interval_qc_mt(
-    vds: hl.vds.VariantDataset,
-    calling_intervals_ht: hl.Table,
+    mt: hl.MatrixTable,
     platform_ht: hl.Table,
-    contigs: List[str] = ["chrX", "chrY", "chr20"],
     mean_dp_thresholds: List[int] = [5, 10, 15, 20, 25],
 ) -> hl.MatrixTable:
     """
     Create a Table of fraction of samples per interval and per platform with mean DP over specified thresholds.
 
-    :param mt: Input interval coverage MatrixTable
+    :param mt: Input sex interval coverage MatrixTable
     :param platform_ht: Input platform assignment Table
-    :param contigs: Which contigs to filter to before computing the fraction of sample over DP thresholds
     :param mean_dp_thresholds: List of mean DP thresholds to use for computing the fraction of samples with mean
         interval DP >= the threshold
     :return: Table with annotations for the fraction of samples per interval and per platform over DP thresholds
     """
+    mt = mt.annotate_cols(platform=platform_ht[mt.col_key].qc_platform)
+    mt = mt.annotate_rows(
+        **{
+            f"over_{dp}x": hl.agg.fraction(mt.mean_dp >= dp)
+            for dp in mean_dp_thresholds
+        }
+    )
+    mt = mt.select_globals(mean_dp_thresholds=mean_dp_thresholds)
+
+    logger.info("Adding per platform aggregation...")
+    platform_mt = mt.group_cols_by(mt.platform).aggregate(
+        **{
+            f"platform_over_{dp}x": hl.agg.fraction(mt.mean_dp >= dp)
+            for dp in mean_dp_thresholds
+        }
+    )
+
+    platform_ht = platform_ht.group_by(platform_ht.qc_platform).aggregate(
+        n_samples=hl.agg.count()
+    )
+    platform_mt = platform_mt.annotate_cols(n_samples=platform_ht[platform_mt.col_key].n_samples)
+
+    return platform_mt
+
+
+def generate_sex_imputation_interval_coverage_mt(
+    vds: hl.vds.VariantDataset,
+    calling_intervals_ht: hl.Table,
+    contigs: List[str] = ["chrX", "chrY", "chr20"],
+) -> hl.MatrixTable:
+    """
+    Create a Table of fraction of samples per interval and per platform with mean DP over specified thresholds.
+
+    :param vds: Input VariantDataset
+    :param contigs: Which contigs to filter to before computing the fraction of sample over DP thresholds
+    :return: Table with annotations for the fraction of samples per interval and per platform over DP thresholds
+    """
     calling_intervals_ht = calling_intervals_ht.filter(
         hl.literal(contigs).contains(calling_intervals_ht.interval.start.contig)
+    )
+    logger.info(
+        "Filtering VariantDataset to the following contigs: %s...",
+        ", ".join(contigs),
     )
     vds = hl.vds.filter_chromosomes(vds, keep=contigs)
     rg = vds.reference_data.locus.dtype.reference_genome
@@ -228,35 +266,7 @@ def generate_sex_imputation_interval_qc_mt(
         "gq_thresholds"
     )
 
-    logger.info(
-        "Filtering interval coverage MatrixTable to the following contigs: %s...",
-        ", ".join(contigs),
-    )
-    contigs = hl.literal(contigs)
-    mt = mt.filter_rows(contigs.contains(mt.interval.start.contig))
-    mt = mt.annotate_cols(platform=platform_ht[mt.col_key].qc_platform)
-    mt = mt.annotate_rows(
-        **{
-            f"over_{dp}x": hl.agg.fraction(mt.mean_dp >= dp)
-            for dp in mean_dp_thresholds
-        }
-    )
-    mt = mt.select_globals(mean_dp_thresholds=mean_dp_thresholds)
-
-    logger.info("Adding per platform aggregation...")
-    platform_mt = mt.group_cols_by(mt.platform).aggregate(
-        **{
-            f"platform_over_{dp}x": hl.agg.fraction(mt.mean_dp >= dp)
-            for dp in mean_dp_thresholds
-        }
-    )
-
-    platform_ht = platform_ht.group_by(platform_ht.qc_platform).aggregate(
-        n_samples=hl.agg.count()
-    )
-    platform_mt = platform_mt.annotate_cols(n_samples=platform_ht[platform_mt.col_key].n_samples)
-
-    return mt, platform_mt
+    return mt
 
 
 def compute_sex(
@@ -574,7 +584,7 @@ def main(args):
                 overwrite=args.overwrite,
             )
 
-        if args.sex_imputation_interval_qc:
+        if args.sex_imputation_interval_coverage:
             vds = get_gnomad_v4_vds(
                 remove_hard_filtered_samples=False,
                 remove_hard_filtered_samples_no_sex=True,
@@ -586,26 +596,32 @@ def main(args):
             platform_ht = load_platform_ht(
                 test, calling_interval_name, calling_interval_padding
             )
-            coverage_mt, platform_mt = generate_sex_imputation_interval_qc_mt(
+            coverage_mt = generate_sex_imputation_interval_coverage_mt(
                 vds,
                 calling_intervals_ht,
-                platform_ht,
                 contigs=["chrX", "chrY", normalization_contig],
-                mean_dp_thresholds=args.mean_dp_thresholds,
             )
             coverage_mt = coverage_mt.annotate_globals(
                 calling_interval_name=calling_interval_name,
                 calling_interval_padding=calling_interval_padding,
             )
-            platform_mt = platform_mt.annotate_globals(
-                calling_interval_name=calling_interval_name,
-                calling_interval_padding=calling_interval_padding,
-            )
-            coverage_mt = coverage_mt.checkpoint(
+            coverage_mt.write(
                 get_checkpoint_path("test_sex_imputation_cov", mt=True)
                 if test
                 else sex_imputation_coverage.path,
                 overwrite=args.overwrite,
+            )
+
+        if args.sex_imputation_interval_qc:
+            if test:
+                coverage_mt = hl.read_matrix_table(get_checkpoint_path("test_sex_imputation_cov", mt=True))
+            else:
+                coverage_mt = sex_imputation_coverage.mt()
+
+            platform_mt = generate_sex_imputation_interval_qc_mt(
+                coverage_mt,
+                platform_ht,
+                mean_dp_thresholds=args.mean_dp_thresholds,
             )
             platform_mt.naive_coalesce(args.interval_qc_n_partitions).write(
                 get_checkpoint_path("test_sex_imputation_cov.per_platform", mt=True)
@@ -613,8 +629,6 @@ def main(args):
                 else sex_imputation_platform_coverage.path,
                 overwrite=args.overwrite,
             )
-            coverage_mt.describe()
-            platform_mt.describe()
 
         if args.impute_sex:
             vds = get_gnomad_v4_vds(
@@ -739,6 +753,11 @@ if __name__ == "__main__":
         help="Number of desired partitions for the f-stat sites output Table.",
         default=1000,
         type=int,
+    )
+    parser.add_argument(
+        "--sex-imputation-interval-coverage",
+        help="",
+        action="store_true",
     )
     parser.add_argument(
         "--sex-imputation-interval-qc",
